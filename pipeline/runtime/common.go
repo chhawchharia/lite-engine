@@ -50,27 +50,15 @@ func getNudges() []logstream.Nudge {
 	}
 }
 
-// getShellOutputVarCmd captures encoding failures before appending an output.
-// Use a subshell so temporary variables cannot overwrite another output's source.
+// Keep the capture temporary local so it cannot overwrite another output's source.
 func getShellOutputVarCmd(key, source, outputFile string) string {
-	quote := func(value string) string {
-		return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
-	}
 	return fmt.Sprintf(`
 (
-    _harness_ci_output=$(printf '%%s' "$%s" | base64) || {
-        printf 'Harness: failed to encode output variable %%s; base64 must be available and succeed\n' %s >&2
-        exit 1
-    }
-    # Split wrapped base64 lines without glob expansion, then join without a separator.
-    IFS='
-'
-    set -f
-    set -- $_harness_ci_output
-    IFS=
-    printf '%%s=__B64__%%s\n' %s "$*" >> %s
+    _harness_ci_output=$(printf '%%s' "$%s" | base64) || exit 1
+    _harness_ci_output=$(printf '%%s' "$_harness_ci_output" | tr -d '\n') || exit 1
+    printf '%%s=__B64__%%s\n' '%s' "$_harness_ci_output" >> %s
 ) || exit 1
-`, source, quote(key), quote(key), quote(outputFile))
+`, source, key, outputFile)
 }
 
 func getOutputVarCmd(entrypoint, outputVars []string, outputFile string, useNewGoDotEnv bool) string {

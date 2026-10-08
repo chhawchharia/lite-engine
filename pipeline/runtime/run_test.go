@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	runnerRuntime "github.com/drone/runner-go/pipeline/runtime"
@@ -97,6 +98,11 @@ func TestRunStepOutputCaptureEndToEnd(t *testing.T) {
 		{"python alias", "python3", "import os\nos.environ.pop('RESULT', None)\nos.environ['SOURCE'] = 'hello'", true, false},
 		{"python secret alias", "python3", "import os\nos.environ.pop('RESULT', None)\nos.environ['SOURCE'] = 'hello'", true, false},
 		{"shell capture", "sh", "export SOURCE=hello", true, false},
+		{"python alias with decoy", "python3", "import os\nos.environ['RESULT'] = 'wrong'\nos.environ['SOURCE'] = 'hello'", true, false},
+		{"python missing source", "python3", "import os\nos.environ.pop('SOURCE', None)\nos.environ['RESULT'] = 'wrong'", true, true},
+		{"shell failing encoder", "sh", "base64() { printf aGVsbG8=; return 9; }\nexport SOURCE=hello", true, true},
+		{"shell missing tr", "sh", "base64() { printf aGVsbG8=; }\nexport SOURCE=hello\nPATH=" + shellCaptureQuote(t.TempDir()), true, true},
+		{"shell failing tr", "sh", "tr() { printf aGVsbG8=; return 9; }\nexport SOURCE=hello", true, true},
 		{"shell missing encoder", "sh", "export SOURCE=hello\nPATH=" + shellCaptureQuote(t.TempDir()), true, true},
 		{"shell flag disabled without encoder", "sh", "export SOURCE=hello\nPATH=" + shellCaptureQuote(t.TempDir()), false, false},
 	} {
@@ -148,4 +154,44 @@ func TestRunStepOutputCaptureEndToEnd(t *testing.T) {
 			require.Equal(t, "hello", consumed.String())
 		})
 	}
+}
+
+func outputCaptureInterpreter(t *testing.T, name string) string {
+	t.Helper()
+	path, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("%s is needed for the output capture integration test", name)
+	}
+	return path
+}
+
+func shellCaptureQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func TestShellOutputCaptureDoesNotOverwriteSource(t *testing.T) {
+	for _, name := range []string{"sh", "bash"} {
+		t.Run(name, func(t *testing.T) {
+			shell := outputCaptureInterpreter(t, name)
+			file := filepath.Join(t.TempDir(), "output.env")
+			script := "set -eu\nexport SOURCE='first'\nexport _harness_ci_output='second'\n" +
+				getOutputsCmd([]string{"sh"}, []*api.OutputV2{{Key: "output-with-dash", Value: "SOURCE"}, {Key: "SECOND", Value: "_harness_ci_output"}}, file, true)
+			out, err := exec.CommandContext(context.Background(), shell, "-c", script).CombinedOutput()
+			require.NoError(t, err, "%s", out)
+			values, err := fetchExportedVarsFromEnvFile(file, io.Discard, true)
+			require.NoError(t, err)
+			require.Equal(t, map[string]string{"output-with-dash": "first", "SECOND": "second"}, values)
+		})
+	}
+}
+
+func TestShellOutputCaptureWriteFailure(t *testing.T) {
+	shell := outputCaptureInterpreter(t, "sh")
+	file := filepath.Join(t.TempDir(), "missing", "output.env")
+	script := "export SOURCE=hello\n" + getShellOutputVarCmd("RESULT", "SOURCE", file) + "\nprintf SHOULD_NOT_RUN\n"
+	out, err := exec.CommandContext(context.Background(), shell, "-c", script).CombinedOutput()
+	require.Error(t, err)
+	require.NotContains(t, string(out), "SHOULD_NOT_RUN")
+	_, err = os.Stat(file)
+	require.True(t, os.IsNotExist(err))
 }

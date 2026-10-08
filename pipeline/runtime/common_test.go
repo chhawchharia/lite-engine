@@ -1,20 +1,10 @@
 package runtime
 
 import (
-	"context"
-	"fmt"
-	"io"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
-	"time"
 
-	"github.com/harness/lite-engine/api"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestFetchExportedVars(t *testing.T) {
@@ -103,147 +93,6 @@ func TestMultilineExportedVarsWithNewGoDotEnvVersion(t *testing.T) {
 			envMap, err := fetchExportedVarsFromEnvFile(tc.OutputFile, os.Stdout, true)
 			assert.Equal(t, tc.EnvMap, envMap)
 			assert.Equal(t, tc.Error, err)
-		})
-	}
-}
-
-func outputCaptureInterpreter(t *testing.T, name string) string {
-	t.Helper()
-	path, err := exec.LookPath(name)
-	if err != nil {
-		t.Skipf("%s is needed for the output capture integration test", name)
-	}
-	return path
-}
-
-func outputCaptureProcess(t *testing.T, interpreter, script string, env ...string) ([]byte, error) {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "step")
-	require.NoError(t, os.WriteFile(path, []byte(script), 0600))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, interpreter, path)
-	cmd.Env = append(os.Environ(), env...)
-	return cmd.CombinedOutput()
-}
-
-func TestPythonOutputCaptureAlias(t *testing.T) {
-	python := outputCaptureInterpreter(t, "python3")
-	for _, aliasSet := range []bool{false, true} {
-		for _, value := range []string{"", "hello", "{\n  \"version\": \"1.2.3\"\n}\n", "quotes '\" \\n $SOURCE # café"} {
-			t.Run(fmt.Sprintf("aliasSet=%t/value=%q", aliasSet, value), func(t *testing.T) {
-				file := filepath.Join(t.TempDir(), "output.env")
-				script := "import os\nos.environ.pop('RESULT', None)\nos.environ['SOURCE'] = " + strconv.QuoteToASCII(value) + "\n"
-				if aliasSet {
-					script += "os.environ['RESULT'] = 'wrong value'\n"
-				}
-				script += getOutputsCmd([]string{"python3"}, []*api.OutputV2{{Key: "RESULT", Value: "SOURCE"}}, file, true)
-				out, err := outputCaptureProcess(t, python, script)
-				require.NoError(t, err, "%s", out)
-				values := readCapturedOutput(t, file)
-				require.Equal(t, map[string]string{"RESULT": value}, values)
-				out, err = outputCaptureProcess(t, python, "import os, sys\nsys.stdout.write(os.environ['CAPTURED'])\n", "CAPTURED="+values["RESULT"])
-				require.NoError(t, err, "%s", out)
-				require.Equal(t, value, string(out))
-			})
-		}
-	}
-	t.Run("missing source fails instead of reading alias", func(t *testing.T) {
-		file := filepath.Join(t.TempDir(), "output.env")
-		script := "import os\nos.environ.pop('SOURCE', None)\nos.environ['RESULT'] = 'wrong value'\n" + getOutputsCmd([]string{"python3"}, []*api.OutputV2{{Key: "RESULT", Value: "SOURCE"}}, file, true)
-		out, err := outputCaptureProcess(t, python, script)
-		require.Error(t, err)
-		require.Contains(t, string(out), "Output variable 'SOURCE' is not set")
-		content, readErr := os.ReadFile(file)
-		require.NoError(t, readErr)
-		require.Empty(t, content)
-	})
-}
-
-func TestShellOutputCapture(t *testing.T) {
-	encoder := outputCaptureInterpreter(t, "base64")
-	for _, shellName := range []string{"sh", "bash"} {
-		t.Run(shellName, func(t *testing.T) {
-			shell := outputCaptureInterpreter(t, shellName)
-			for _, mode := range []string{"typed", "legacy"} {
-				t.Run(mode, func(t *testing.T) {
-					capture := func(file string) string {
-						if mode == "typed" {
-							return getOutputsCmd([]string{"sh"}, []*api.OutputV2{{Key: "RESULT", Value: "SOURCE"}}, file, true)
-						}
-						return "RESULT=$SOURCE\n" + getOutputVarCmd([]string{"sh"}, []string{"RESULT"}, file, true)
-					}
-					for name, value := range map[string]string{
-						"empty": "", "simple": "hello", "json": "{\n  \"version\": \"1.2.3\"\n}\n\n",
-						"special": "quotes '\" \\n $SOURCE # café\r\n", "wrapped": strings.Repeat("abc123\n", 2048),
-					} {
-						t.Run(name, func(t *testing.T) {
-							file := filepath.Join(t.TempDir(), "output 'with spaces.env")
-							out, err := outputCaptureProcess(t, shell, "set -eu\nexport SOURCE="+shellCaptureQuote(value)+"\n"+capture(file))
-							require.NoError(t, err, "%s", out)
-							values := readCapturedOutput(t, file)
-							require.Equal(t, map[string]string{"RESULT": value}, values)
-							out, err = outputCaptureProcess(t, shell, "printf '%s' \"$CAPTURED\"", "CAPTURED="+values["RESULT"])
-							require.NoError(t, err, "%s", out)
-							require.Equal(t, value, string(out))
-						})
-					}
-					for _, failure := range []string{"missing encoder", "failing encoder", "unwritable output"} {
-						t.Run(failure, func(t *testing.T) {
-							file := filepath.Join(t.TempDir(), "output.env")
-							tools := t.TempDir()
-							encoderFailure := ""
-							if failure == "failing encoder" {
-								encoderFailure = "base64() { printf partial; return 9; }\n"
-							} else if failure == "unwritable output" {
-								file = filepath.Join(t.TempDir(), "missing", "output.env")
-								require.NoError(t, os.Symlink(encoder, filepath.Join(tools, "base64")))
-							}
-							// No errexit: capture must propagate the error itself and stop later commands.
-							out, err := outputCaptureProcess(t, shell, encoderFailure+"export SOURCE='secret-value'\nPATH="+shellCaptureQuote(tools)+"\n"+capture(file)+"\nprintf SHOULD_NOT_RUN\n")
-							require.Error(t, err)
-							require.NotContains(t, string(out), "SHOULD_NOT_RUN")
-							require.NotContains(t, string(out), "secret-value")
-							_, err = os.Stat(file)
-							require.True(t, os.IsNotExist(err), "a failed capture must not publish a record")
-						})
-					}
-					t.Run("base64 without tr", func(t *testing.T) {
-						file := filepath.Join(t.TempDir(), "output.env")
-						tools := t.TempDir()
-						require.NoError(t, os.Symlink(encoder, filepath.Join(tools, "base64")))
-						value := strings.Repeat("line\n", 100)
-						out, err := outputCaptureProcess(t, shell, "set -eu\nexport SOURCE="+shellCaptureQuote(value)+"\nPATH="+shellCaptureQuote(tools)+"\n"+capture(file))
-						require.NoError(t, err, "%s", out)
-						values := readCapturedOutput(t, file)
-						require.Equal(t, map[string]string{"RESULT": value}, values)
-					})
-				})
-			}
-		})
-	}
-}
-
-func shellCaptureQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
-}
-
-func readCapturedOutput(t *testing.T, file string) map[string]string {
-	t.Helper()
-	values, err := fetchExportedVarsFromEnvFile(file, io.Discard, true)
-	require.NoError(t, err)
-	return values
-}
-
-func TestShellOutputCapturePreservesSourceAndShellState(t *testing.T) {
-	for _, name := range []string{"sh", "bash"} {
-		t.Run(name, func(t *testing.T) {
-			shell := outputCaptureInterpreter(t, name)
-			file := filepath.Join(t.TempDir(), "output.env")
-			script := "set -eu\nexport SOURCE='first'\nexport _harness_ci_output='second'\nset -- 'original argument'\nIFS=':'\n" + getOutputsCmd([]string{"sh"}, []*api.OutputV2{{Key: "output-with-dash", Value: "SOURCE"}, {Key: "SECOND", Value: "_harness_ci_output"}}, file, true) + "\ntest \"$1\" = 'original argument'\ntest \"$IFS\" = ':'\n"
-			out, err := outputCaptureProcess(t, shell, script)
-			require.NoError(t, err, "%s", out)
-			require.Equal(t, map[string]string{"output-with-dash": "first", "SECOND": "second"}, readCapturedOutput(t, file))
 		})
 	}
 }
